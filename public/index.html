@@ -1441,8 +1441,12 @@ var ALIGN = {
     var now = opt.now || new Date();
     var amzDate = _amz(now), dateStamp = amzDate.slice(0, 8);
     var host = c.bucket + '.cos.' + c.region + '.myqcloud.com';
+    /* canonical URI 和 canonical query string 在 SigV4 里是分开的两行，
+     * 列对象（ListObjects）要靠 ?prefix=... 传参，所以这里拆开。
+     * 没有 query 时 query 是空串，和原来的 path + '\n\n' 完全等价，不影响已有功能。 */
     var path = '/' + cosPath(String(key).replace(/^\/+/, ''));
-    var url = 'https://' + host + path;
+    var query = opt.query || '';
+    var url = 'https://' + host + path + (query ? '?' + query : '');
 
     var body = opt.body;
     var hasBody = (body !== null && body !== undefined);
@@ -1472,7 +1476,7 @@ var ALIGN = {
 
         var names = Object.keys(hdrs).sort();
         var canonHdrs = names.map(function (n) { return n + ':' + String(hdrs[n]).trim() + '\n'; }).join('');
-        var canonReq = method + '\n' + path + '\n\n' + canonHdrs + '\n' +
+        var canonReq = method + '\n' + path + '\n' + query + '\n' + canonHdrs + '\n' +
                        names.join(';') + '\n' + payloadHash;
         var scope = dateStamp + '/' + c.region + '/s3/aws4_request';
 
@@ -1563,6 +1567,57 @@ var ALIGN = {
         throw new Error('图床上传失败（HTTP ' + r.status + '）' + msg);
       });
     });
+  }
+
+  /* 列出 COS 上某个前缀下的对象（ListObjects）。
+   * 删档案时只删了文字记录，图片对象还留在桶里变成孤儿，
+   * 靠这个把它们找出来。COS 一次最多返回 1000 个，IsTruncated 时翻页。 */
+  function cosListObjects(prefix) {
+    var out = [], marker = '';
+    var step = function () {
+      var q = 'prefix=' + encodeURIComponent(prefix) + '&max-keys=1000';
+      if (marker) q += '&marker=' + encodeURIComponent(marker);
+      return cosReq('GET', '', { query: q }).then(function (r) {
+        if (r.status !== 200) {
+          return r.text().then(function (t) {
+            throw new Error(cosErrText(r.status, t));
+          });
+        }
+        return r.text();
+      }).then(function (xml) {
+        var blocks = String(xml).match(/<Contents>[\s\S]*?<\/Contents>/g) || [];
+        blocks.forEach(function (b) {
+          var k = (/<Key>([^<]*)<\/Key>/.exec(b) || [])[1];
+          var s = parseInt((/<Size>(\d+)<\/Size>/.exec(b) || [])[1] || '0', 10);
+          if (k) out.push({ key: k, size: s });
+        });
+        var trunc = /<IsTruncated>\s*true\s*<\/IsTruncated>/i.test(xml);
+        if (trunc && blocks.length) {
+          marker = out[out.length - 1].key;
+          return step();
+        }
+        return out;
+      });
+    };
+    return step();
+  }
+
+  /* 删除 COS 上的一个对象 */
+  function cosDeleteObject(key) {
+    return cosReq('DELETE', key, {}).then(function (r) {
+      if (r.status === 204 || r.status === 200) return true;
+      return r.text().then(function (t) {
+        throw new Error(cosErrText(r.status, t));
+      });
+    });
+  }
+
+  /* 从图片的公开 URL 反推出它在桶里的 key */
+  function cosKeyFromUrl(u) {
+    var s = String(u || '');
+    var i = s.indexOf('.myqcloud.com/');
+    if (i < 0) return '';
+    return decodeURIComponent(s.slice(i + '.myqcloud.com/'.length).split('?')[0]);
   }
 
   /* ---------- dataURL <-> Blob ---------- */
@@ -1899,15 +1954,33 @@ var ALIGN = {
     var hit = TS_CACHE[raw];
     if (hit !== undefined) return hit;
     var t = 0;
-    if (raw) t = Date.parse(raw.replace(' ', 'T')) || 0;
+    if (raw) t = parseTs(raw);
     if (!t) {
       var rc = String(r.createdAt || '');
       var h2 = TS_CACHE[rc];
       if (h2 !== undefined) t = h2;
-      else { t = Date.parse(rc.replace(' ', 'T')) || 0; if (TS_CACHE_N < 8000) { TS_CACHE[rc] = t; TS_CACHE_N++; } }
+      else { t = parseTs(rc); if (TS_CACHE_N < 8000) { TS_CACHE[rc] = t; TS_CACHE_N++; } }
     }
     if (TS_CACHE_N < 8000) { TS_CACHE[raw] = t; TS_CACHE_N++; }
     return t;
+  }
+
+  /* 时间解析：兼容「2026-10-19 14:22:24」和毫秒时间戳两种写法。
+   * 【坑】原来只走 Date.parse(raw.replace(' ','T'))，
+   * 而 Date.parse("1792394144552") 是 NaN —— 纯数字时间戳一律解析成 0。
+   * ts 为 0 时墓碑过滤会「保守保留」记录（if (!ts) return true），
+   * 于是删掉的档案在同步后又被云端那份拉回来 = 复活，
+   * 并且墓碑随后被当作过期清掉，从此永远删不掉。
+   * 数据来自 CSV 导入、旧备份、同步链接时都可能带数字时间，必须兜住。 */
+  function parseTs(s) {
+    var raw = String(s == null ? '' : s).trim();
+    if (!raw) return 0;
+    if (/^\d+$/.test(raw)) {
+      var n = Number(raw);
+      if (raw.length <= 10) return n > 0 ? n * 1000 : 0;   // 秒级
+      return n > 0 ? n : 0;                                 // 毫秒级
+    }
+    return Date.parse(raw.replace(' ', 'T')) || 0;
   }
 
   /* 字段级时间戳：记录每个字段最后被改动的时刻。
@@ -3192,7 +3265,7 @@ var ALIGN = {
     };
   })();
 
-  var APP_VERSION = '2026.10.18-b14';
+  var APP_VERSION = '2026.10.19-b15';
 
   var GIST_READ_LIMIT = 1024 * 1024;          // 1 MB：单个文件超过就读不回来
   var GIST_WARN_LIMIT = 700 * 1024;           // 700 KB：开始预警
@@ -3326,7 +3399,12 @@ var ALIGN = {
    * 两张图只要文件名和尺寸都一样，就极可能是同一张图的不同压缩版本。
    * 用于兜底识别没有 pid 的老图（旧版本上传的）。 */
   function photoLooseKey(p) {
-    if (!p || !p.data) return '';
+    if (!p) return '';
+    /* 外置图（COS）没有 data，只有 url —— url 本身就是最好的唯一标识，
+     * 直接拿它当 key。少了这一条，photoLooseKey 对外置图一律返回 ''，
+     * 判重会把它们全当成"无标识"，去重时整批丢掉。 */
+    if (!p.data && PhotoX.isUrl(p.url)) return 'url:' + String(p.url);
+    if (!p.data) return '';
     var nm = String(p.name || '').trim();
     if (!nm) return '';
     /* 【重点】优先用「原始尺寸」ow/oh，而不是当前尺寸 w/h。
@@ -3353,11 +3431,11 @@ var ALIGN = {
     return uid();   // 连文件名都没有，只能随机（概率极低）
   }
   function photoKey(p) {
-    if (!p || !p.data) return '';
+    if (!p) return '';
     if (p.pid) return 'pid:' + p.pid;                       // 最可靠：上传时生成的唯一 ID
     var lk = photoLooseKey(p);
     if (lk) return lk;                                      // 老数据兜底：同名同尺寸
-    return 'raw:' + p.data;                                 // 再兜底：内容完全相同（原行为）
+    return 'raw:' + (p.data || p.url || '');                // 再兜底：内容完全相同（原行为）
   }
   /* 合并一组图片：同一张图（photoKey 相同）只留一份。
    * 多个版本时保留体积最小的 —— 那通常是压缩过的，
@@ -3365,7 +3443,12 @@ var ALIGN = {
   function dedupePhotoList(list) {
     var items = [];
     (list || []).forEach(function (p) {
-      if (!p || !p.data) return;                            // 丢弃空项
+      /* 【坑】原来这里写的是 if (!p || !p.data) return;
+       * 但配了 COS 图床后，图片是「外置」的：只有 url，data 为空。
+       * 于是每次保存档案 / 同步合并 / 启动时的自动去重，
+       * 都会把外置图当成"空项"整批丢掉 —— 表现就是图片莫名其妙全没了。 */
+      if (!p) return;
+      if (!p.data && !PhotoX.isUrl(p.url)) return;          // 既无内联数据也无外链，才丢弃
       items.push(p);
     });
     /* 【关键】两级判重，用并查集合并：
@@ -3883,9 +3966,14 @@ var ALIGN = {
       var before = r.photos.length;
       var kept = [];
       r.photos.forEach(function (p) {
-        if (!p || !p.data) { removed++; return; }
-        var d = String(p.data);
-        if (d.indexOf('data:image/') !== 0 || d.length < 100) { removed++; return; }
+        if (!p) { removed++; return; }
+        /* 外置图（COS）没有 data，用 url 判断好坏；内联图才校验 data:image/ 前缀 */
+        if (!p.data) {
+          if (!PhotoX.isUrl(p.url)) { removed++; return; }
+        } else {
+          var d = String(p.data);
+          if (d.indexOf('data:image/') !== 0 || d.length < 100) { removed++; return; }
+        }
         if (!p.pid) { p.pid = pidFromPhoto(p); fixedMark++; }
         if (!p.pq) { p.pq = photoPresetKey(); fixedMark++; }
         if (!p.ow || !p.oh) { p.ow = p.w || 0; p.oh = p.h || 0; }
@@ -8163,7 +8251,11 @@ var ALIGN = {
           '只要配了图床，在别的设备导入后照样能看图。</p>';
       })() +
       '<div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0">' +
-      '<button class="btn" id="bkOrphan">🧹 清理无引用的本机图片</button></div>' +      '<p class="hint">本机档案 ' + db.records.length + ' 条，变更记录 ' + db.logs.length + ' 条。</p>' +
+      '<button class="btn" id="bkOrphan">🧹 清理无引用的本机图片</button>' +
+      '<button class="btn" id="bkCosOrphan">☁️ 清理云端孤儿图片</button></div>' +
+      '<p class="hint">本机档案 ' + db.records.length + ' 条，变更记录 ' + db.logs.length + ' 条。<br>' +
+      '<b>两个清理的区别</b>：「本机图片」只清这台设备 IndexedDB 里的副本；' +
+      '「云端孤儿图片」才会真正删掉腾讯云 COS 里没人引用的图。</p>' +
       (db.records.some(function (r) { return r.demo; })
         ? '<div style="margin-top:8px"><button class="btn sm" id="bkClearDemo">清除内置的 3 条示例档案</button></div>' : '');
     openModal('备份 / 迁移', html, [{ text: '关闭', cls: 'btn ghost', fn: closeModal }]);
@@ -8223,6 +8315,71 @@ var ALIGN = {
             closeModal(); setTimeout(openBackup, 200);
           });
       }).catch(function (e) { btn.disabled = false; toast('清理失败：' + e.message, true); });
+    };
+    /* 清理 COS 上没人引用的图片。
+     * 判定依据是「本机所有档案里出现的图片 URL」——所以必须在档案最全的那台设备上做，
+     * 否则别的设备上还有、但这台没有的档案，它们的图会被误删。 */
+    var cop = $('#bkCosOrphan');
+    if (cop) cop.onclick = function () {
+      if (!cosReady()) {
+        toast('请先配好图床：缺 ' + cosMissing().join('、'), true); return;
+      }
+      openModal('正在扫描云端图片…', '<p class="hint" id="coMsg">读取腾讯云 COS 上的图片列表…</p>', []);
+      var used = {};
+      (db.records || []).forEach(function (r) {
+        (r.photos || []).forEach(function (p) {
+          var u = (p && (p.url || (PhotoX.isUrl(p.data) ? p.data : ''))) || '';
+          var k = cosKeyFromUrl(u);
+          if (k) used[k] = 1;
+        });
+      });
+      cosListObjects('photos/').then(function (list) {
+        var orphan = list.filter(function (o) {
+          return !used[o.key] && o.key.indexOf('_test_') < 0;
+        });
+        var totalBytes = orphan.reduce(function (a, o) { return a + (o.size || 0); }, 0);
+        var mb = function (b) { return (b / 1048576).toFixed(2) + ' MB'; };
+        if (!orphan.length) {
+          closeModal();
+          toast('云端没有孤儿图片，很干净（共 ' + list.length + ' 张都在用）');
+          return;
+        }
+        openModal('清理云端孤儿图片',
+          '<p>云端共 <b>' + list.length + '</b> 张图片，其中 <b style="color:#b91c1c">' +
+          orphan.length + '</b> 张没有档案引用（约 <b>' + mb(totalBytes) + '</b>）。</p>' +
+          '<p class="hint">这些多半是删掉的档案留下的——删档案只删了文字记录，图片对象还留在桶里。</p>' +
+          '<div class="box danger" style="margin:10px 0">' +
+          '<b>删除前务必确认</b>：判定依据是<b>这台设备上</b>的档案。' +
+          '如果还有别的设备持有这台没同步到的档案，它们的图会被误删。<br>' +
+          '建议<b>先在档案最全的那台设备上同步一次</b>再操作。</div>' +
+          '<p class="hint">删除后<b>无法恢复</b>，图片会从腾讯云永久消失。</p>',
+          [
+            { text: '取消', cls: 'btn ghost', fn: closeModal },
+            { text: '确认删除 ' + orphan.length + ' 张', cls: 'btn danger', fn: function () {
+              openModal('正在删除…', '<p class="hint" id="coDel">0 / ' + orphan.length + '</p>', []);
+              var i = 0, fail = 0;
+              var next = function () {
+                if (i >= orphan.length) {
+                  closeModal();
+                  toast(fail ? ('已删除 ' + (orphan.length - fail) + ' 张，' + fail + ' 张失败')
+                            : ('已清理 ' + orphan.length + ' 张云端孤儿图片'));
+                  return;
+                }
+                var o = orphan[i];
+                cosDeleteObject(o.key).catch(function () { fail++; }).then(function () {
+                  i++;
+                  var el = $('#coDel');
+                  if (el) el.textContent = i + ' / ' + orphan.length;
+                  next();
+                });
+              };
+              next();
+            } }
+          ]);
+      }).catch(function (e) {
+        closeModal();
+        toast('扫描失败：' + (e && e.message), true);
+      });
     };
     var dpp = $('#bkDedupePhoto');
     if (dpp) dpp.onclick = function () {
