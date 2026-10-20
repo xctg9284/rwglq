@@ -1432,6 +1432,36 @@ var ALIGN = {
    *      多一个少一个都会 403，所以这里显式列出而不是动态收集。 */
   var COS_EMPTY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 
+  /* SigV4 的 canonical query string 有两条硬性要求：
+   *   1) 参数名必须按字典序排序
+   *   2) 参数名和值都要按 RFC3986 编码（比 encodeURIComponent 更严，!'()* 也要转义）
+   * 顺序排错，算出来的签名就跟服务端对不上，
+   * 而服务端只会回一句看不懂的 SignatureDoesNotMatch。
+   * 另外 URL 上拼的和参与签名的必须是同一个串，所以统一在这里生成。 */
+  function _rfc3986(s) {
+    return encodeURIComponent(s).replace(/[!'()*]/g, function (c) {
+      return '%' + c.charCodeAt(0).toString(16).toUpperCase();
+    });
+  }
+  function cosCanonQuery(q) {
+    var pairs = [];
+    if (q && typeof q === 'object') {
+      Object.keys(q).forEach(function (k) {
+        if (q[k] === null || q[k] === undefined || q[k] === '') return;
+        pairs.push([k, String(q[k])]);
+      });
+    } else if (typeof q === 'string' && q) {
+      q.split('&').forEach(function (seg) {
+        if (!seg) return;
+        var i = seg.indexOf('=');
+        pairs.push([decodeURIComponent(i < 0 ? seg : seg.slice(0, i)),
+                    decodeURIComponent(i < 0 ? '' : seg.slice(i + 1))]);
+      });
+    }
+    pairs.sort(function (a, b) { return a[0] < b[0] ? -1 : (a[0] > b[0] ? 1 : 0); });
+    return pairs.map(function (p) { return _rfc3986(p[0]) + '=' + _rfc3986(p[1]); }).join('&');
+  }
+
   function cosReq(method, key, opt) {
     opt = opt || {};
     var c = coscfg();
@@ -1445,7 +1475,8 @@ var ALIGN = {
      * 列对象（ListObjects）要靠 ?prefix=... 传参，所以这里拆开。
      * 没有 query 时 query 是空串，和原来的 path + '\n\n' 完全等价，不影响已有功能。 */
     var path = '/' + cosPath(String(key).replace(/^\/+/, ''));
-    var query = opt.query || '';
+    /* 排序 + RFC3986 编码，保证 URL 上的和参与签名的是同一个串 */
+    var query = cosCanonQuery(opt.params || opt.query);
     var url = 'https://' + host + path + (query ? '?' + query : '');
 
     var body = opt.body;
@@ -1516,6 +1547,22 @@ var ALIGN = {
     var msg = (/<(?:Message|message)>([^<]*)<\//.exec(txt || '') || [])[1] || '';
     var body = msg || String(txt || '').slice(0, 160) || '无详细信息';
     if (status === 403) {
+      /* 403 有两类，含义完全不同，必须分开讲，否则会一直往错误的方向排查：
+       *   SignatureDoesNotMatch = 签名对不上（密钥错 / 地域错 / 桶名错），不是权限问题
+       *   AccessDenied          = 密钥本身没问题，但没这个桶的权限 */
+      if (/SignatureDoesNotMatch/i.test(code)) {
+        return 'HTTP 403：签名对不上（SignatureDoesNotMatch）。' +
+          '<b>这不是权限问题</b>——权限不足会返回 AccessDenied。' +
+          '请依次核对：① SecretKey 有没有抄错（最常见，注意大小写和数字 0 与字母 O）；' +
+          '② 程序里选的地域和桶所在地域是否一致；③ 桶名是否带了 -APPID 后缀。' +
+          '（COS 返回：' + code + ' ' + body + '）';
+      }
+      if (/AccessDenied/i.test(code)) {
+        return 'HTTP 403：密钥没有这个桶的权限（AccessDenied）。' +
+          '说明 SecretId/SecretKey 本身是对的，缺的是授权：' +
+          '到「访问管理 → 用户 → 策略」给这个密钥绑定 COS 权限（如 QcloudCOSFullAccess）。' +
+          '（COS 返回：' + code + ' ' + body + '）';
+      }
       return 'HTTP 403：签名被拒。常见原因：① SecretId/SecretKey 抄错；' +
         '② 地域和桶所在地域不一致；③ 子账号没有这个桶的读写权限；④ 桶名少了 -APPID 后缀。' +
         (code ? '（COS 返回：' + code + ' ' + body + '）' : '');
@@ -1575,9 +1622,9 @@ var ALIGN = {
   function cosListObjects(prefix) {
     var out = [], marker = '';
     var step = function () {
-      var q = 'prefix=' + encodeURIComponent(prefix) + '&max-keys=1000';
-      if (marker) q += '&marker=' + encodeURIComponent(marker);
-      return cosReq('GET', '', { query: q }).then(function (r) {
+      var pr = { 'prefix': prefix, 'max-keys': '1000' };
+      if (marker) pr['marker'] = marker;
+      return cosReq('GET', '', { params: pr }).then(function (r) {
         if (r.status !== 200) {
           return r.text().then(function (t) {
             throw new Error(cosErrText(r.status, t));
@@ -3265,7 +3312,7 @@ var ALIGN = {
     };
   })();
 
-  var APP_VERSION = '2026.10.19-b15';
+  var APP_VERSION = '2026.10.19-b16';
 
   var GIST_READ_LIMIT = 1024 * 1024;          // 1 MB：单个文件超过就读不回来
   var GIST_WARN_LIMIT = 700 * 1024;           // 700 KB：开始预警
@@ -8230,6 +8277,7 @@ var ALIGN = {
       (db.settings.syncOn && db.settings.room && db.settings.provider === 'gist'
         ? '<button class="btn primary" id="bkCloudInt">☁ 验证云端数据完整性</button>' : '') +
       '<button class="btn primary" id="bkSyncLog">📋 同步日志（看真实 HTTP 记录）</button>' +
+      '<button class="btn primary" id="bkCosChk">🔌 COS 自检（区分签名错 / 权限错）</button>' +
       '<button class="btn primary" id="bkTokenChk">🔑 令牌体检（查 401 到底为什么）</button>' +
       (db.settings.syncOn && db.settings.provider === 'gist'
         ? '<button class="btn danger" id="bkRebuild">🚑 重建云端空间（根治截断）</button>' : '') +
@@ -8298,6 +8346,8 @@ var ALIGN = {
     if (sl) sl.onclick = function () { closeModal(); setTimeout(openSyncLog, 200); };
     var tc = $('#bkTokenChk');
     if (tc) tc.onclick = function () { closeModal(); setTimeout(openTokenCheck, 200); };
+    var cc = $('#bkCosChk');
+    if (cc) cc.onclick = function () { closeModal(); setTimeout(openCosCheck, 200); };
     var rb = $('#bkRebuild');
     if (rb) rb.onclick = function () { closeModal(); setTimeout(openRebuild, 200); };
     /* 这个按钮是备份面板里的，面板 HTML 动态生成，
@@ -8979,7 +9029,108 @@ var ALIGN = {
    * 顺带把最坑的一点讲清楚：GitHub 那个「Generate new token ▾」是**下拉按钮**，
    * 展开后有两项。很多人直接点，默认落到 Fine-grained —— 而 Fine-grained
    * 官方明确不支持 Gist，于是新令牌生成完就是废的，怎么填都 401。 */
-  function openTokenCheck() {
+    /* ---------- COS 自检：把「签名错」和「权限错」分开 ----------
+   * 403 有两类，排查方向完全相反，光看一句「签名被拒」会一直往错的方向查。
+   * 探针思路：去读一个「一定不存在」的 key，看 COS 怎么回：
+   *   签名正确 → 404 NoSuchKey（说明密钥/地域/桶名四项全对）
+   *   签名错误 → 403 SignatureDoesNotMatch
+   *   没有授权 → 403 AccessDenied
+   *   连不上   → CORS 没配
+   * 再列一次对象验「列出」权限，最后 PUT+DELETE 验「写」权限。 */
+  function openCosCheck() {
+    var c = coscfg();
+    var miss = [];
+    if (!c.region) miss.push('所属地域');
+    if (!c.bucket) miss.push('存储桶名');
+    if (!c.ak) miss.push('SecretId');
+    if (!c.sk) miss.push('SecretKey');
+    if (miss.length) {
+      openModal('COS 自检',
+        '<p class="hint" style="color:#b91c1c"><b>还差 ' + miss.join('、') + ' 没填。</b></p>' +
+        '<p class="hint">去「设置 → ☁️ 图片云端图床」把四项填全再来。</p>',
+        [{ text: '关闭', cls: 'btn ghost', fn: closeModal },
+         { text: '去设置', cls: 'btn primary', fn: function () { closeModal(); setTimeout(openSettings, 150); } }]);
+      return;
+    }
+    var html = '<div class="sec-title">① 配置</div>';
+    html += '<p class="hint">地域 <b>' + esc(c.region) + '</b> ｜ 桶 <b>' + esc(c.bucket) + '</b></p>';
+    html += '<p class="hint">SecretId <b>' + esc(String(c.ak).slice(0, 8)) + '••••</b>（共 ' + String(c.ak).length + ' 位）</p>';
+    if (!/-\d{6,}$/.test(String(c.bucket))) {
+      html += '<p class="hint" style="color:#b91c1c">✘ 桶名看着没带 -APPID 后缀，正确形如 <b>rwglq1-1500702359</b>。</p>';
+    }
+    html += '<div class="sec-title">② 连接测试</div>';
+    html += '<p class="hint" id="ccMsg">正在测试，请稍候…</p>';
+    openModal('COS 自检', html, [{ text: '关闭', cls: 'btn ghost', fn: closeModal }]);
+
+    var lines = [];
+    var probe = '__cos_selftest_' + Date.now() + '.txt';
+    var msg = function () {
+      var el = $('#ccMsg');
+      if (el) { el.innerHTML = lines.join('<br><br>'); el.style.color = /✘/.test(lines.join('')) ? '#b91c1c' : ''; }
+    };
+    var codeOf = function (t) { return (/<(?:Code|code)>([^<]*)<\//.exec(t || '') || [])[1] || ''; };
+
+    /* 探针 1：读一个不存在的 key */
+    cosReq('GET', probe, {}).then(function (r) {
+      return r.text().then(function (t) {
+        var cd = codeOf(t);
+        if (r.status === 404 || /NoSuchKey/i.test(cd)) {
+          lines.push('✓ <b>签名通过</b>：COS 回 404 NoSuchKey（对象本来就不存在）。' +
+            '这说明 <b>SecretId / SecretKey / 地域 / 桶名四项全对</b> —— 不是权限问题。');
+        } else if (r.status === 403) {
+          if (/SignatureDoesNotMatch/i.test(cd)) {
+            lines.push('✘ <b>签名对不上</b>（SignatureDoesNotMatch）。<b>这不是权限问题</b> —— ' +
+              '权限不足会返回 AccessDenied。请核对：① <b>SecretKey 抄错</b>（最常见，注意 0 与 O、l 与 I、大小写）；' +
+              '② 程序里选的地域和桶所在地域是否一致（桶在上海就要选「华东（上海）」）；' +
+              '③ 桶名是否带了 -APPID 后缀。');
+          } else if (/AccessDenied/i.test(cd)) {
+            lines.push('✘ <b>没有权限</b>（AccessDenied）。密钥本身是对的，缺的是授权：' +
+              '到「访问管理 → 用户 → 策略」给这个密钥绑定 COS 权限（如 QcloudCOSFullAccess）。');
+          } else {
+            lines.push('✘ HTTP 403：' + esc(cd || '未知错误'));
+          }
+        } else {
+          lines.push('· 探针返回 HTTP ' + r.status + ' ' + esc(cd));
+        }
+      });
+    }).catch(function (e) {
+      lines.push('✘ 连不上 COS：' + esc(e && e.message) + '<br>' +
+        '多半是跨域（CORS）没配：桶 → 安全管理 → 跨域访问 CORS → 来源 *，' +
+        '方法勾 <b>PUT / GET / HEAD / DELETE</b>，Allow-Headers *，<b>Expose-Headers 填 ETag</b>。');
+    }).then(function () {
+      /* 探针 2：列对象（带 query，顺带验证排序后的签名） */
+      return cosReq('GET', '', { params: { 'prefix': 'photos/', 'max-keys': '1' } })
+        .then(function (r) {
+          if (r.status === 200) { lines.push('✓ <b>列对象通过</b>：能列出桶里的文件。'); return; }
+          return r.text().then(function (t) {
+            lines.push('✘ 列对象失败：HTTP ' + r.status + ' ' + esc(codeOf(t)) +
+              '（若上面探针 1 通过而这里 403，多半是 ListObjects 权限没开）');
+          });
+        }).catch(function (e) {
+          lines.push('✘ 列对象失败：' + esc(e && e.message));
+        });
+    }).then(function () {
+      /* 探针 3：写 + 删 */
+      return cosReq('PUT', probe, { body: 'ok', contentType: 'text/plain' }).then(function (r) {
+        if (r.status === 200 || r.status === 201) {
+          lines.push('✓ <b>写入通过</b>：能往桶里放文件。');
+          return cosReq('DELETE', probe, {}).then(function () {
+            lines.push('✓ 删除通过：探针文件已自动清掉。');
+          }).catch(function () {
+            lines.push('· 写入成功，但删除探针失败（CORS 里没勾 DELETE 就会这样）。' +
+              '去桶里手动删掉 ' + esc(probe) + '，并在 CORS 方法里补勾 <b>DELETE</b>。');
+          });
+        }
+        return r.text().then(function (t) {
+          lines.push('✘ 写入失败：HTTP ' + r.status + ' ' + esc(codeOf(t)));
+        });
+      }).catch(function (e) {
+        lines.push('✘ 写入失败：' + esc(e && e.message));
+      });
+    }).then(msg).catch(msg);
+  }
+
+function openTokenCheck() {
     var tk = String((db.settings && db.settings.gistToken) || '').trim();
     var html = '';
 
